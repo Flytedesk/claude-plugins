@@ -1,6 +1,6 @@
 {
   "name": "@flytedesk/claude-plugins",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Flytedesk Claude Code plugins: SSP / ad-ops domain knowledge for engineers working on the ad platform.",
   "license": "UNLICENSED",
   "repository": {

@@ -220,6 +220,16 @@ Then click the real Submit button.
 
 **Verification note:** after an SSP save, live propagation on this platform commonly takes 6-10+ minutes — not instant, and not a simple browser-cache issue (the debug console's own live config fetch shows the old value for several minutes post-save). Don't conclude a fix failed just because it looks unchanged 30 seconds after saving — wait and re-check.
 
+**Another verification gotcha — checking on a zero-fill load gives a false negative:** the ad unit's per-unit Custom CSS (including this `opacity: 1 !important` fix) is only injected into the page as a `<style>` tag when the unit actually HAS an assigned/rendering ad. On a page load with zero fill (production mode with no real inventory, or a moment where Kevel simply didn't return a candidate), you will find ZERO matching `<style>` tags in the DOM even though the fix IS correctly saved in the SSP and WILL work — there's just nothing to style yet. Checking for the style tag (or checking `getComputedStyle` on an `<img>` that doesn't exist because nothing rendered) on a zero-fill load and concluding "the fix isn't applied" is a false negative. Always force `&fdtest` (guaranteed test creative) when checking whether a Pattern B fix actually took effect — don't rely on production fill, which can be intermittently zero (see Pattern D) independent of whether the CSS fix itself is correct:
+
+```js
+// After loading with &fdtest and waiting for render — confirm BOTH that a style tag exists AND the real image is opacity 1:
+const el = document.querySelector('.flytead-au_XXXX');
+const styleTags = Array.from(document.querySelectorAll('style')).filter(s => s.textContent.includes('au_XXXX'));
+const imgs = el ? Array.from(el.querySelectorAll('img')) : [];
+console.log({ styleTagFound: styleTags.length > 0, imgs: imgs.map(img => ({ src: img.src, opacity: getComputedStyle(img).opacity })) });
+```
+
 ## Pattern C — Known tooling limitation: some masked/formatted numeric fields resist browser automation
 
 Found on **Minimum Spacing (Above)** (`auto_inject_min_spacing`), displayed as e.g. "1,000 px" — a masked/formatted number input (Cleave.js-style).
@@ -279,6 +289,52 @@ el.dispatchEvent(new Event('change', {bubbles: true}));
 Adjust the selector fragment to match whatever third-party vendor markup is actually present on the target site — don't copy the Empower Local selector blindly onto a site running a different ad network; always verify via the ancestor-chain diagnostic first.
 
 **Applied on:** themiamihurricane.com, both In-Content Top and Middle units — both fixes (Pattern E exclusion + Pattern B opacity CSS) applied together, confirmed saved in SSP, live verification still pending propagation delay as of this writing.
+
+## Pattern F — nodeOffset.count requires more paragraphs than the article has
+
+Found on statenews.com's In-Content | Middle unit, via direct injector-log + DOM investigation (not guessed).
+
+**Symptom:** the ad unit gets a real ad assigned from Kevel (`Ad Unit has N active ads. Requesting decision from kevel` → `Built ad from Kevel response`), but never actually renders anywhere on the page. The injector log shows it reach `"Inject element into"` and then immediately fail with `"The resolved node did not allow injection"` / `"The node failed to locate injectable context node"`. This can easily be misdiagnosed as a Minimum Spacing problem (a pixel-offset value that's too large for the article's content height) — that was the working theory before this session actually read the injector log for the specific failing article and found the real, more precise mechanism below.
+
+**Root cause:** In-Content ad unit settings include a `nodeOffset` object separate from `minSpacing`:
+
+```json
+"nodeOffset": { "count": 8, "xpath": "//p", "enabled": true, "spacing": 0 }
+```
+
+When `enabled: true`, this requires the algorithm to see at least `count` real paragraph (`//p`, or whatever xpath is configured) elements in the target container — after excluding anything matched by `xpathReject` — before it will consider ANY valid injection point, independent of `minSpacing`. If the article's content container doesn't have that many paragraphs, the unit can never find a valid injection point, no matter what `minSpacing` is set to. A working sibling unit on the same page (e.g. In-Content | Top) commonly has a much lower `nodeOffset.count` (e.g. `2`), which is why Top renders fine while Middle silently fails on short articles.
+
+**Diagnostic:** compare the unit's configured `nodeOffset.count` against how many real (non-rejected) paragraphs actually exist in the live article:
+
+```js
+// Read the unit's own nodeOffset requirement:
+const u = Object.values(window.$fdConfig.manager.manager.adUnits).find(x => x.settings?.id === 'au_XXXX');
+console.log(u.settings.auto_inject.nodeOffset, u.settings.auto_inject.xpathReject);
+```
+
+```js
+// Count real, non-rejected paragraphs in the live content container (adjust selector/rejectSelectors to match the unit's own xpath/xpathReject):
+const container = document.querySelector('.arx-content'); // match the unit's Include(XPath) target class
+const allPs = Array.from(container.querySelectorAll('p'));
+const rejectSelectors = ['kicker','d-flex','dom-art-container','mb-4','mt-3']; // match the unit's xpathReject class list
+function isRejected(p) {
+  let node = p;
+  while (node && node !== container) {
+    const cls = (node.className || '').toString();
+    if (rejectSelectors.some(r => cls.split(' ').includes(r))) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+console.log('real paragraphs available:', allPs.filter(p => !isRejected(p)).length);
+```
+
+If the live paragraph count is below the unit's `nodeOffset.count`, that's the mechanism — confirmed, not guessed.
+
+**Fix options** (this is a judgment call, not a single "correct" answer — present both, don't pick one for the reader):
+
+1. Lower `nodeOffset.count` to something short articles on this property can realistically satisfy (e.g., match or come close to the sibling Top unit's own count).
+2. Treat it as intentional — if the unit is deliberately meant to only appear on longer articles (so "Middle" lands meaningfully deep in the content rather than right after Top), then a short article correctly getting no Middle ad is by design, not a bug. Confirm intent with whoever owns the SKU/placement strategy before changing it, and test against a genuinely longer article on the same property to see if the unit behaves normally there.
 
 ## Step 4 — Apply the fix in the SSP
 
