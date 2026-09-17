@@ -243,6 +243,43 @@ Found on **Minimum Spacing (Above)** (`auto_inject_min_spacing`), displayed as e
 
 **What to do:** this is out of scope for placement/CSS fixes. Do NOT force the Pattern B Custom CSS fix onto a unit with zero real fill — there's no image to reveal, so it will do nothing and just adds noise to the ad unit's config. Report the zone ID(s), site ID, and the `candidatesFoundCount: 0` evidence, and hand off to whoever has Kevel API/campaign access to check decision reason codes / campaign eligibility for that zone.
 
+## Pattern E — injector nests the ad inside a third-party ad network's own placement div
+
+**Symptom:** the ad unit renders, but its actual creative image shows `opacity: 0` — looks like Pattern B at first glance. But inspecting the DOM ancestor chain of the flytedesk ad div reveals it's nested several levels deep INSIDE another ad network's own placement div, rather than being a normal sibling within the article's paragraph flow. Found on themiamihurricane.com, where the flytedesk ad div sat inside Empower Local's own markup: `div#placement_1166636_0_i` → `div#placement_1166636_0` → `div#emp-3ecb6.emp-action.emp-ad`.
+
+**Root cause:** the ad unit's Exclude (XPath) (commonly the default `.//figure|.//img|.//figcaption`) does not exclude other ad vendors' in-article ad slot divs. When a third-party ad network embeds its own ad slot directly in the article's content flow — a common publisher pattern, where multiple ad networks' tags all inject into the same content area — flytedesk's in-content offset-walking algorithm treats that third-party div as ordinary content height to walk through. If the computed target offset lands inside that div's subtree, the algorithm injects the flytedesk ad div AS A CHILD of it instead of between real article paragraphs.
+
+**This can compound with Pattern B:** even when nested this way, the ad can still receive real fill and attempt to render — but the theme's Pattern B `opacity:0` CSS rule still applies to the image regardless of the extra wrapper divs (CSS descendant selectors don't care about intermediate nesting depth). So a property can need BOTH the Pattern B Custom CSS fix AND this Pattern E Exclude-XPath fix together to actually become visible. On themiamihurricane.com specifically, Pattern B's fix had never been applied before because every earlier diagnostic check happened to catch the page in a zero-fill state (see Pattern D) — it took a live user-provided example with real fill present to reveal that Pattern B also applied here, compounded with this nesting bug.
+
+**Diagnostic:** walk the ad unit's DOM ancestor chain looking for ids/classes that don't belong to the site's own theme/CMS markup — they'll usually look like another ad vendor's naming convention (`emp-`, `placement_`, `div-gpt-ad`, `google_ads_iframe`, etc., varies by vendor):
+
+```js
+let node = document.querySelector('[class*="flytead-au_"]'); // or target a specific unit's class
+const chain = [];
+for (let i = 0; i < 6 && node; i++) {
+  chain.push({ tag: node.tagName, id: node.id, cls: (node.className || '').toString().slice(0, 60) });
+  node = node.parentElement;
+}
+console.log(chain);
+```
+
+If you see the flytead div's immediate parent (or grandparent) has an id/class pattern that doesn't match the site's own CMS/theme conventions, that's the signature — cross-reference against what other ad networks/tags are known to run on that property.
+
+**Fix:** append an exclusion for that specific vendor's div pattern to the ad unit's Exclude (XPath) field (a plain text `<input>`, set reliably via native setter + dispatched events, same technique as other text inputs in this doc):
+
+```js
+const el = document.activeElement; // after clicking into the Exclude (XPath) field
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+const newValue = el.value + "|.//div[contains(@class,'emp-ad')]|.//div[starts-with(@id,'placement_')]";
+nativeSetter.call(el, newValue);
+el.dispatchEvent(new Event('input', {bubbles: true}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+```
+
+Adjust the selector fragment to match whatever third-party vendor markup is actually present on the target site — don't copy the Empower Local selector blindly onto a site running a different ad network; always verify via the ancestor-chain diagnostic first.
+
+**Applied on:** themiamihurricane.com, both In-Content Top and Middle units — both fixes (Pattern E exclusion + Pattern B opacity CSS) applied together, confirmed saved in SSP, live verification still pending propagation delay as of this writing.
+
 ## Step 4 — Apply the fix in the SSP
 
 1. `platform.flytedesk.com` → **Suppliers** → find/switch to the supplier → open the property (or use **Inventory** with a Medium = Website filter to browse sibling properties for comparison).
@@ -269,3 +306,4 @@ Found on **Minimum Spacing (Above)** (`auto_inject_min_spacing`), displayed as e
 - Driving a Tom-Select (or similar JS-enhanced) dropdown by setting the value on the underlying hidden `<select>` via JS instead of clicking the real widget — it can appear to work in a screenshot while silently failing to persist (Pattern A).
 - Concluding a fix "didn't take" seconds after an SSP save without budgeting for real propagation delay — it commonly takes 6-10+ minutes on this platform, not seconds (Pattern B).
 - Applying the Pattern B Custom CSS fix to a unit with zero real fill (`assignedAds.length === 0`, `candidatesFoundCount: 0`) — check fill state first (see Pattern D), the CSS fix only helps when a real image is assigned but hidden.
+- Assuming a visible-but-invisible (opacity:0) ad is automatically Pattern B — first check the DOM ancestor chain for nesting inside a different ad vendor's own placement div (Pattern E); the two can compound, and the Exclude (XPath) fix and the Custom CSS fix are both needed in that case.
