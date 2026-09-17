@@ -1,0 +1,15 @@
+{
+  "name": "flytedesk-plugins",
+  "owner": {
+    "name": "Flytedesk",
+    "email": "dan@flytedesk.com"
+  },
+  "description": "Flytedesk Claude Code plugins: SSP / ad-ops domain knowledge for engineers working on the ad platform.",
+  "plugins": [
+    {
+      "name": "ad-ops",
+      "source": "./ad-ops",
+      "description": "Flytedesk SSP ad-ops: diagnose and fix ad unit placement/injection issues (masthead, sticky bottom, interstitial, in-content/ICV) on publisher websites."
+    }
+  ]
+}
