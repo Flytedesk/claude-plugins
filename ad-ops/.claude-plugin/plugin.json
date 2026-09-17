@@ -1,7 +1,7 @@
 {
   "name": "ad-ops",
   "description": "Flytedesk SSP ad-ops: ad unit placement diagnosis and configuration for publisher websites (masthead, sticky bottom, interstitial, in-content/ICV).",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Flytedesk",
     "email": "dan@flytedesk.com"

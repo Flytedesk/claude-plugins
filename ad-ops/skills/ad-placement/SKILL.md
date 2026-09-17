@@ -67,6 +67,42 @@ Array.from(document.querySelectorAll('[class*="flytead-au_"]')).map(el => ({
 document.getElementById('<fd-unit id from the log>').parentElement
 ```
 
+### Faster alternative: read the logger and Kevel response straight from the console
+
+Clicking through the debug console's UI to open each card and hit **Logs** is fine for one unit, but slow when you need to check several units or re-check after an SSP save. Everything the UI shows (and more) is reachable directly off `window.$fdConfig`:
+
+```js
+// List every ad unit with its settings/errors/fill state in one shot:
+Object.entries(window.$fdConfig.manager.manager.adUnits).map(([id, u]) => ({
+  id, name: u.name || u.settings?.name, errors: u.errors,
+  assignedAds: u.assignedAds?.length, divs: u.divs?.length,
+}))
+```
+
+```js
+// Full injector log trace for one unit (same content as the UI's "Logs" button, but instant):
+const u = Object.values(window.$fdConfig.manager.manager.adUnits)[0]; // pick the index for the unit you want
+u.logger.messages.map(m => Array.isArray(m) ? m.map(x => typeof x === 'object' ? '[obj]' : String(x)).join(' ') : String(m))
+```
+
+```js
+// The raw Kevel decision response for that unit (candidatesFoundCount is the key field — see Pattern D below).
+// Note: log message objects contain circular references (a `logger` back-reference), so a plain JSON.stringify
+// throws "Converting circular structure to JSON" — use this replacer to skip it:
+const decisionMsg = u.logger.messages.find(m => Array.isArray(m) && m[0] === 'Decision response from Kevel (direct fetch)');
+const seen = new WeakSet();
+JSON.stringify(decisionMsg[1], (k, v) => {
+  if (k === 'logger') return undefined;
+  if (typeof v === 'object' && v !== null) { if (seen.has(v)) return '[circular]'; seen.add(v); }
+  return v;
+}, 1)
+```
+
+```js
+// Confirm Test Mode actually engaged (don't assume the &fdtest URL param worked — verify it):
+window.$fdConfig.testMode // should be true
+```
+
 ## Step 3 — Know the two placement families
 
 | Family | Units | Algorithm | Include (XPath) target |
@@ -194,6 +230,19 @@ Found on **Minimum Spacing (Above)** (`auto_inject_min_spacing`), displayed as e
 
 **Guidance:** don't burn more than ~2-3 attempts on this field type once the revert-on-blur signature is confirmed. Hand off to a human to edit it manually in the SSP UI, and note the exact field and target value needed.
 
+## Pattern D — real Kevel zero-fill vs. Pattern B (don't confuse them)
+
+**The confusion:** both Pattern B (theme CSS hiding a real image) and genuine Kevel zero-fill can present as "the ad isn't showing" / "ICVs are blank" on first glance, but they are completely different problems requiring completely different fixes. This session got it wrong more than once before telling them apart reliably — don't repeat that.
+
+**How to tell them apart (the decisive check):** with `&fdtest` forced (guaranteed test creative, bypassing real inventory), check whether the ad unit actually has an assigned creative:
+
+- **Pattern B**: the ad `<img>` (or video) IS present in the DOM, IS assigned a real creative URL (e.g. `src` pointing to `cdn.fdsk.co/assets/production/in_content.png` in test mode), the container has real dimensions — it's just invisible because `getComputedStyle(img).opacity` is `0`. `assignedAds.length` for that unit is > 0. This is a CSS problem — the Custom CSS fix (Pattern B) is correct.
+- **Real Kevel zero-fill**: the ad container itself never gets populated — `display: none`, `0x0` dimensions, `assignedAds.length` is `0`, and the injector log shows `Ads returned for <id>: null` / `No ads were assigned to the Ad Unit` even under forced Test Mode. Checking the raw decision response (the console snippet in Step 2 above) shows `candidatesFoundCount: 0`. **This happens even in forced test mode** — normally `&fdtest` guarantees a creative regardless of real inventory, so if it's STILL returning zero candidates, something is wrong upstream of placement entirely (Kevel zone/campaign/ad-size config for that specific zone ID, or an account-level test-mode issue) — a CSS fix cannot help because there is no image to reveal.
+
+**A strong corroborating signal for genuine zero-fill:** check whether other ad units on the same page/property (e.g. Masthead, Interstitial, Sticky Bottom) are getting real fill normally, including in production (not just test mode). If those are fine but specifically the units in question return zero candidates even in forced test mode, that's strong evidence of a Kevel-side zone/campaign eligibility problem specific to those zone IDs — not a sitewide script/injection bug and not a CSS visibility bug. Conversely, if literally every ad unit on the page (including ones that normally work in production) returns zero candidates even in forced test mode, that points to a broader Kevel account/test-mode issue rather than something specific to the units being debugged. Either way, it's a Kevel-side problem, not something fixable in SSP Placement Settings.
+
+**What to do:** this is out of scope for placement/CSS fixes. Do NOT force the Pattern B Custom CSS fix onto a unit with zero real fill — there's no image to reveal, so it will do nothing and just adds noise to the ad unit's config. Report the zone ID(s), site ID, and the `candidatesFoundCount: 0` evidence, and hand off to whoever has Kevel API/campaign access to check decision reason codes / campaign eligibility for that zone.
+
 ## Step 4 — Apply the fix in the SSP
 
 1. `platform.flytedesk.com` → **Suppliers** → find/switch to the supplier → open the property (or use **Inventory** with a Medium = Website filter to browse sibling properties for comparison).
@@ -219,3 +268,4 @@ Found on **Minimum Spacing (Above)** (`auto_inject_min_spacing`), displayed as e
 - Fixing an XPath and stopping there — always also check Injection Algorithm. An XPath-only fix can leave the ad correctly scoped but still landing in the wrong spot (Pattern A).
 - Driving a Tom-Select (or similar JS-enhanced) dropdown by setting the value on the underlying hidden `<select>` via JS instead of clicking the real widget — it can appear to work in a screenshot while silently failing to persist (Pattern A).
 - Concluding a fix "didn't take" seconds after an SSP save without budgeting for real propagation delay — it commonly takes 6-10+ minutes on this platform, not seconds (Pattern B).
+- Applying the Pattern B Custom CSS fix to a unit with zero real fill (`assignedAds.length === 0`, `candidatesFoundCount: 0`) — check fill state first (see Pattern D), the CSS fix only helps when a real image is assigned but hidden.
