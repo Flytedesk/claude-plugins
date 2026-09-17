@@ -107,6 +107,93 @@ This also explains reports of it happening "only on the home page": `/html/body`
    ```
 5. Leave Minimum Spacing, Close Button, and Custom CSS as they were unless the user asks you to change them too. Don't silently copy a reference property's spacing values — those are a per-property editorial choice, not part of the placement fix.
 
+## Pattern A — Injection Algorithm "Append" vs "In-Content"
+
+**Symptom:** the Include (XPath) is scoped correctly to the article/content-body container, but the ad still lands in the wrong spot within it — most often reported as "the ad is still getting placed at the end of this article" even after the XPath itself was fixed. With two In-Content units on the same page (e.g. Top and Middle), it can also show up as "top in content is showing up below the middle."
+
+**Root cause:** the **Injection Algorithm** field is a separate setting from Include (XPath), and "Append" behaves very differently from "In-Content":
+
+- "Append" is a literal DOM `appendChild` into whatever Include (XPath) resolves to — no spacing/offset logic at all.
+- If the XPath targets a specific paragraph (e.g. `.../p[3]`), Append nests the ad **inside** that `<p>`, which is invalid HTML and breaks text flow.
+- If the XPath targets the whole container (e.g. `.../entry-content`), Append puts the ad as the **last child** of the container — i.e. at the very end of the article, not distributed through it.
+- When two ad units (Top and Middle) both use Append into the *same* container, whichever one injects second in script execution order lands physically below the other — regardless of which one is named "Top" and which is named "Middle." Naming is not placement.
+
+**Diagnostic tell in the injector Logs** (Step 2): the trace still walks `Injector: current offset is X/Y` and a handful of `Injector: Rejecting Nodes` entries, then `Inject element into id(...)` resolves to a location that doesn't match where you'd expect — for Append-into-whole-container, that location is the container's last child.
+
+**Fix:** change the **Injection Algorithm** dropdown from "Append" to "In-Content."
+
+**Critical UI gotcha:** the dropdown is a Tom-Select widget (`select#auto_inject_algorithm`, `data-controller="tom-select"`), not a plain `<select>`. Setting the value via JS on the hidden native `<select>` — e.g. `Object.getOwnPropertyDescriptor(...).set` plus dispatched `change`/`input` events — *looks* like it worked in a screenshot (the visible control shows the new value) but silently fails to persist: the SSP's real saved state doesn't change. The only reliable method:
+
+1. Click the visible Tom-Select control to open it.
+2. Scroll to see the options (Append / Prepend / In-Content).
+3. Click "In-Content" directly.
+4. Click Submit.
+5. Verify via the read-only Placement Settings summary view showing "Injection Algorithm: In-Content" after reload — don't trust the open dropdown's own display, reload and re-check the summary.
+
+**Important:** a placement bug can have *both* an XPath problem and an Algorithm problem at the same time. Fixing only the XPath (per the Common bug above) is not sufficient if Algorithm is also wrong — always check both independently.
+
+## Pattern B — Theme lazy-load CSS hides the injected `<img>` (opacity: 0, never fades in)
+
+**Symptom:** the ad **container** renders completely fine — correct size, correct position, close button present, mute icon on video units, click-through link works — but the `<img>` (or video poster) inside it is invisible. Reported by users as "ICVs are blank," "in-content ads are showing all white," or "this one is in the right place, showing up as blank," usually with a screenshot of a real ad container (black bar, mute icon, close button) that's visually empty.
+
+**Root cause** (confirmed via live DevTools and reproduced on 4 separate properties this session, all running the tagDiv "Newspaper" WordPress theme): the theme ships a broad CSS rule along these lines:
+
+```css
+body.td-animation-stack-type0 .post img:not(.woocommerce-product-gallery img):not(.rs-pzimg) { opacity: 0; }
+```
+
+intended as a scroll-triggered fade-in effect for the theme's *own* lazy-loaded images. The theme's JS flips matching images to `opacity: 1` once its own lazy-load observer sees them — but it never sees flytedesk-injected images, since they aren't part of the theme's lazy-load pipeline, so they stay invisible forever.
+
+**This is easy to misdiagnose as a Kevel fill/inventory problem** ("no ads were assigned," "zero fill") because a quick DOM check might not immediately reveal that the image is present-but-invisible rather than absent. This session repeatedly got this wrong at first. Always check computed opacity/visibility before concluding "no fill" — DOM presence/absence and a quick glance are not enough.
+
+**Diagnostic JS** (run after loading with `?fddebug&fdtest`, wait 8-10s for real render):
+
+```js
+document.querySelectorAll('[class*="flytead-au_"] img').forEach(img =>
+  console.log(img.closest('[class*="flytead-au_"]').className.match(/au_[A-Za-z0-9]+/)[0], img.src, getComputedStyle(img).opacity));
+```
+
+Confirm the exact CSS rule responsible:
+
+```js
+Array.from(document.styleSheets).forEach(s => { try { Array.from(s.cssRules).forEach(r => {
+  if (r.selectorText && img.matches(r.selectorText.split(',')[0].trim()) && r.style.opacity) console.log(r.selectorText, r.href);
+})} catch(e){} });
+```
+
+**Fix:** append (never replace or remove existing rules) to the ad unit's existing **Custom CSS** field in the SSP:
+
+```css
+div.flytead-au_<UNIT_ID> img {
+  opacity: 1 !important;
+}
+```
+
+`!important` is required to beat the theme's specificity. Unlike the Injection Algorithm dropdown (Pattern A), the Custom CSS field is a plain `<textarea id="auto_inject_css">`, so setting it via native setter + dispatched events works reliably:
+
+```js
+const ta = document.getElementById('auto_inject_css');
+const newValue = ta.value + '\n\ndiv.flytead-au_XXXX img {\n  opacity: 1 !important;\n}';
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+nativeSetter.call(ta, newValue);
+ta.dispatchEvent(new Event('input', {bubbles: true}));
+ta.dispatchEvent(new Event('change', {bubbles: true}));
+```
+
+Then click the real Submit button.
+
+**Verification note:** after an SSP save, live propagation on this platform commonly takes 6-10+ minutes — not instant, and not a simple browser-cache issue (the debug console's own live config fetch shows the old value for several minutes post-save). Don't conclude a fix failed just because it looks unchanged 30 seconds after saving — wait and re-check.
+
+## Pattern C — Known tooling limitation: some masked/formatted numeric fields resist browser automation
+
+Found on **Minimum Spacing (Above)** (`auto_inject_min_spacing`), displayed as e.g. "1,000 px" — a masked/formatted number input (Cleave.js-style).
+
+**Symptom:** the field reverts to its original value on blur regardless of input method tried — triple-click + type, native-setter + dispatched `input`/`change`/`blur` events, End + repeated Backspace all fail identically. This isn't a business-rule minimum: both a lower and a higher target value were tested, and both reverted the same way. It's a tooling/automation limitation specific to this masked-input widget type, not a validation rule.
+
+**Downstream effect:** if Minimum Spacing is set higher than the actual article's content-container height, the in-content spacing algorithm never finds a valid injection point and the unit simply never renders — not blank, *absent*.
+
+**Guidance:** don't burn more than ~2-3 attempts on this field type once the revert-on-blur signature is confirmed. Hand off to a human to edit it manually in the SSP UI, and note the exact field and target value needed.
+
 ## Step 4 — Apply the fix in the SSP
 
 1. `platform.flytedesk.com` → **Suppliers** → find/switch to the supplier → open the property (or use **Inventory** with a Medium = Website filter to browse sibling properties for comparison).
@@ -128,3 +215,7 @@ This also explains reports of it happening "only on the home page": `/html/body`
 - Copying a reference property's Include (XPath) verbatim without checking the target site's own DOM — CMS templates vary even within the same platform family.
 - Treating "no ads returned" in the Kevel logs as a placement bug — it's a separate fill/inventory investigation with a different fix.
 - Editing Placement Settings before reading the injector Logs. The log tells you exactly what XPath ran and what it found; skipping it means debugging blind.
+- Concluding "zero fill / Kevel issue" from DOM presence/absence or a quick glance alone — always verify with computed style (`getComputedStyle(el).opacity`, `.display`) plus a visual screenshot first (see Pattern B).
+- Fixing an XPath and stopping there — always also check Injection Algorithm. An XPath-only fix can leave the ad correctly scoped but still landing in the wrong spot (Pattern A).
+- Driving a Tom-Select (or similar JS-enhanced) dropdown by setting the value on the underlying hidden `<select>` via JS instead of clicking the real widget — it can appear to work in a screenshot while silently failing to persist (Pattern A).
+- Concluding a fix "didn't take" seconds after an SSP save without budgeting for real propagation delay — it commonly takes 6-10+ minutes on this platform, not seconds (Pattern B).
