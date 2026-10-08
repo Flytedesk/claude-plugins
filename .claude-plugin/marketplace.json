@@ -9,7 +9,7 @@
     {
       "name": "ad-ops",
       "source": "./ad-ops",
-      "description": "Flytedesk SSP ad-ops: diagnose and fix ad unit placement/injection issues (masthead, sticky bottom, interstitial, in-content/ICV) on publisher websites."
+      "description": "Flytedesk SSP ad-ops: diagnose and fix ad unit placement/injection issues (masthead, sticky bottom, interstitial, in-content/ICV, sidebar) on publisher websites."
     }
   ]
 }

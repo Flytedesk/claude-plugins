@@ -6,7 +6,7 @@ Claude Code plugins carrying Flytedesk-specific engineering knowledge — SSP/ad
 
 | Plugin | Purpose |
 |---|---|
-| `ad-ops` | SSP ad unit placement diagnosis and configuration (masthead, sticky bottom, interstitial, in-content/ICV). |
+| `ad-ops` | SSP ad unit placement diagnosis and configuration (masthead, sticky bottom, interstitial, in-content/ICV, sidebar Medium Rectangle/Skyscraper). |
 
 ## Install
 
