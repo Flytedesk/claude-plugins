@@ -40,7 +40,8 @@ Every investigation, SSP edit and verification on a property is done by a **Sonn
 - the injector log excerpt for that unit;
 - the before and after values of every Placement Settings field it changed;
 - the console XPath test results;
-- a screenshot of each verification page (Step 5, or step 4 of "Sidebar units");
+- for sidebar units, the spacing measurements before and after (step 4 of "Sidebar units") and any Custom CSS it appended;
+- a screenshot of each verification page (Step 5, or step 5 of "Sidebar units");
 - any open question, or anything it couldn't do.
 
 ## Step 0 — Open the in-app browser and authenticate
@@ -238,14 +239,51 @@ The first entry that is not `null` is where the unit injects. Expected results:
 
 - **Include (XPath)**: the unit's own value from step 2. The two units' values differ: only the Medium Rectangle has the article-body fallback.
 - **Injection Algorithm**: **Append**. It's a Tom-Select dropdown: click the real widget, then verify after a reload (see Pattern A).
-- Leave Exclude (XPath), Custom CSS and Close Button as they are unless asked. Append ignores Exclude (XPath).
+- **Custom CSS**: append only the sidebar-scoped spacing rule from step 4, if one is needed. Leave Exclude (XPath) and Close Button as they are unless asked. Append ignores Exclude (XPath).
 - Medium Rectangle and Skyscraper are separate ad units, each edited individually (no bulk edit). When both go into the same sidebar, both are appended, and whichever injects second lands below the other (see Pattern A: naming is not placement). If the stacking order matters to the publisher, ask; don't assume.
 
-### 4. Verify every rule, for both units
+### 4. Match the spacing of the sidebar's own items
+
+**Always**, for both units. In the sidebar, our unit must sit at the same distance from the item above it as the sidebar's items sit from each other. It also keeps the same left/right inset as those items, and the same space below it as the sidebar's last item had. The ad's base `.flytead` class has no margin, so without this the unit usually sits flush against the last widget.
+
+Measure on an article page with a sidebar, loaded with `?fddebug&fdtest` so the unit renders:
+
+```js
+// Spacing of the sidebar's own items, and where our unit actually landed:
+const sb = document.querySelector('<sidebar CSS selector>');
+const cs = getComputedStyle(sb);
+const kids = Array.from(sb.children).filter(el => !el.matches('script, style, link') && el.getBoundingClientRect().height > 0);
+({
+  sidebar: { display: cs.display, rowGap: cs.rowGap, padding: cs.padding },
+  items: kids.map((el, i) => {
+    const s = getComputedStyle(el), r = el.getBoundingClientRect(), prev = kids[i - 1]?.getBoundingClientRect();
+    return { el: el.matches('.flytead') ? 'OUR UNIT' : el.tagName + (el.id ? '#' + el.id : '') + ' ' + (el.getAttribute('class') || '').slice(0, 40),
+      gapAbove: prev ? Math.round(r.top - prev.bottom) : null, left: Math.round(r.left), right: Math.round(r.right),
+      margin: s.margin, padding: s.padding };
+  }),
+})
+```
+
+1. **Find the target gap.** It is the `gapAbove` the sidebar's own items share. If they vary, use the gap between its last two items, since ours goes below the last one. The left/right inset is the items' `left`/`right` edges.
+2. **Compare it with what our unit already gets.** The theme's own rules can already style our div. Examples are a flex/grid `row-gap` on the sidebar, or a rule like `.sidebar > div { margin-bottom: 30px }`. If our unit's `gapAbove`, edges and the space below it already match, **add nothing**. Extra margin on top of a theme `gap` doubles the space.
+3. **Otherwise, close the difference with Custom CSS.** Append it to the unit's existing **Custom CSS** field (a plain textarea; see Pattern B). Never replace or remove the CSS already there. Scope the rule to the sidebar so the Medium Rectangle's article-body fallback isn't affected:
+   ```css
+   <sidebar CSS selector> > div.flytead-au_<UNIT_ID> {
+     margin: <top>px <right>px <bottom>px <left>px;
+   }
+   ```
+   - In normal block layout, adjacent vertical margins collapse: the gap equals the **larger** of the item's `margin-bottom` and our `margin-top`. So `margin-top: <target gap>` gives exactly the target gap.
+   - In a flex/grid sidebar, margins add to each other and to `gap`. Subtract what is already there.
+   - Add `!important` only when a theme rule is overriding yours.
+4. **Re-measure after saving** (allow for propagation delay; see Pattern B). Our unit's `gapAbove`, edges and space below must equal the target. A margin you calculated but didn't re-measure isn't matched.
+
+Match spacing only. Don't copy the items' backgrounds, borders or headings onto the ad. If the sidebar's items are visually boxed in a way the ad looks wrong without, report it rather than styling it unasked.
+
+### 5. Verify every rule, for both units
 
 Load each page with `?fddebug&fdtest`:
 
-1. **Article with a sidebar, both units.** The log shows `Injecting ad unit at xPath`, then `append ad unit div … into context <sidebar>`. The unit's div's `parentElement` is the sidebar column, and nothing of the sidebar's own content sits below it. Take a screenshot of it rendering at the bottom of the sidebar.
+1. **Article with a sidebar, both units.** The log shows `Injecting ad unit at xPath`, then `append ad unit div … into context <sidebar>`. The unit's div's `parentElement` is the sidebar column, and nothing of the sidebar's own content sits below it. The step 4 measurement shows its gap above, edges and space below matching the sidebar's items. Take a screenshot of it rendering at the bottom of the sidebar.
 2. **Article without a sidebar** (if the site has that template):
    - Medium Rectangle: the log shows `append ad unit div … into context <article-body>`. Its div is the article-body container's last child, below the last paragraph. Take a screenshot.
    - Skyscraper: the log shows `The xPath was not found`, and `document.querySelector('.flytead-au_XXXX')` is `null`.
@@ -500,6 +538,8 @@ If the live paragraph count is below the unit's `nodeOffset.count`, that's the m
 - Concluding "zero fill / Kevel issue" from DOM presence/absence or a quick glance alone — always verify with computed style (`getComputedStyle(el).opacity`, `.display`) plus a visual screenshot first (see Pattern B).
 - Giving the Skyscraper any non-sidebar fallback. With no sidebar it must not inject at all.
 - Giving the Medium Rectangle any no-sidebar fallback other than the article-body container (never `/html/body`, never a wrapper that also holds comments or related stories), or putting that fallback anywhere but **last** in the `;` list.
+- Leaving a sidebar unit flush against the widget above it, or adding margin without first measuring the gap the theme already gives it (doubling a flex/grid `gap`). Sidebar spacing must match the sidebar's own items, re-measured after the save.
+- Sidebar spacing CSS that isn't scoped to the sidebar. It also moves the Medium Rectangle when it falls back to the article body.
 - A sidebar-unit XPath where a sidebar entry lacks the `[//<article-body>]` guard. It injects into the home page's and listing pages' sidebars.
 - Treating `The xPath was not found` as a bug when it appears on a non-article page (either unit) or on a sidebar-less article (Skyscraper). That's the article-only / no-sidebar rule working.
 - Fixing an XPath and stopping there — always also check Injection Algorithm. An XPath-only fix can leave the ad correctly scoped but still landing in the wrong spot (Pattern A).
