@@ -12,6 +12,37 @@ description: Diagnose and fix ad unit placement/injection issues on Flytedesk SS
 - You're setting up or debugging a sidebar unit (Flytedesk Medium Rectangle, Flytedesk Skyscraper) — see "Sidebar units" under Step 3.
 - An ad unit isn't visibly rendering and you need to tell whether that's a placement/injection failure or an ad-fill (Kevel) problem — these are independent failure modes and the fix is completely different for each.
 
+## Who does the work: the main agent orchestrates, Sonnet sub-agents do it
+
+**Always.** The main agent (the one talking to the user) never does the hands-on placement work itself, even for a single unit. It does three things:
+- it **orchestrates**: scopes the work, dispatches sub-agents, and checks what they bring back;
+- it handles **sign-in** (Step 0);
+- it handles **every question for the user**.
+
+Every investigation, SSP edit and verification on a property is done by a **Sonnet sub-agent at medium effort**: the Agent tool with `model: "sonnet"` and `effort: "medium"`, or the `danxbot:worker-sonnet-medium` agent type where the danxbot plugin is installed.
+
+**The main agent:**
+
+1. **Scopes the work** into a list: property (site + SSP supplier/property) × ad unit × the target behaviour from this skill (e.g. "Medium Rectangle: sidebar bottom, else article bottom").
+2. **Does Step 0 itself**: opens the browser and waits for the user to sign in to the SSP. The sign-in persists in the browser, so sub-agents reuse it. A sub-agent never asks for or enters credentials.
+3. **Dispatches one sub-agent per property.** Its prompt is self-contained:
+   - load the `ad-ops:ad-placement` skill;
+   - the site URL, the SSP supplier/property, and the units and target behaviour for each;
+   - work in **your own new browser tab** (`tabs_create`, then pass that `tabId` on every browser call), so parallel sub-agents don't drive each other's page;
+   - don't ask the user anything: stop and return the open question instead;
+   - return the evidence listed below.
+
+   Run independent properties in parallel. Never give the same ad unit to two sub-agents, because concurrent SSP saves to one unit overwrite each other.
+4. **Checks each result against its evidence** before reporting. A claim without its evidence goes back to the sub-agent, or to a fresh one. It is not passed on to the user.
+5. **Owns the user conversation**: the judgment calls this skill says to ask about (which sidebar side, unit stacking order, Pattern F intent), plus fields needing a human (Pattern C). It collects them and answers sub-agents with `SendMessage`.
+
+**A sub-agent returns, per unit:**
+- the injector log excerpt for that unit;
+- the before and after values of every Placement Settings field it changed;
+- the console XPath test results;
+- a screenshot of each verification page (Step 5, or step 4 of "Sidebar units");
+- any open question, or anything it couldn't do.
+
 ## Step 0 — Open the in-app browser and authenticate
 
 Open the Browser pane and navigate to `platform.flytedesk.com`. **The user authenticates, not you** — never enter a password or other credential yourself. Wait for them to sign in, then confirm you're logged in (screenshot or `read_page`) before doing anything else.
@@ -110,31 +141,35 @@ window.$fdConfig.testMode // should be true
 |---|---|---|---|
 | **Body-level** | Masthead, Sticky Bottom, Interstitial | Prepend / fixed | Almost always `/html/body` — **this is correct** for these units. If one of these looks visually broken, it is rarely the XPath; look at Custom CSS / z-index / stacking-context conflicts instead. These units float or overlay above page content, so they're the ones that collide with a site's own sticky header, cookie banner, or z-index rules. |
 | **In-Content (ICV)** | In-Content \| Top, In-Content \| Middle, and similarly named units | "In-Content" or "Append" | Must be scoped to the site's **actual article/content-body container** — never `/html/body`. This is the family that gets misconfigured in practice; see below. |
-| **Sidebar** | Flytedesk Medium Rectangle, Flytedesk Skyscraper | "Append" | The site's own sidebar container (left or right), guarded so it only resolves on article pages — never `/html/body`, never the article body. See "Sidebar units" below. |
+| **Sidebar** | Flytedesk Medium Rectangle, Flytedesk Skyscraper | "Append" | The site's own sidebar container (left or right), guarded so it only resolves on article pages — never `/html/body`. With no sidebar, Medium Rectangle falls back to the article body and Skyscraper injects nothing. See "Sidebar units" below. |
 
 Don't assume `/html/body` is "the bug" reflexively — check which family you're looking at first. It's correct for one family and wrong for the others.
 
 ## Sidebar units — Flytedesk Medium Rectangle and Flytedesk Skyscraper
 
-These are product rules for both units, not per-property tuning choices:
+These are product rules, not per-property tuning choices:
 
-1. **Article pages only.** Never the home page, section/listing pages, or any other non-article page.
-2. **Always the sidebar** — the left or the right one, whichever the site's article template has.
+1. **Article pages only**, for both units. Never the home page, section/listing pages, or any other non-article page.
+2. **The sidebar first** — the left or the right one, whichever the site's article template has.
 3. **The bottom of the sidebar** — the ad is the sidebar's last child.
-4. **No sidebar on the article page → no ad.** Never fall back to `/html/body`, the article body, or any other container.
+4. **An article page with no sidebar** — the two units differ:
+   - **Medium Rectangle → the bottom of the article.** It becomes the last child of the article-body container, after the article's last paragraph.
+   - **Skyscraper → no ad.**
+
+   Neither unit ever falls back to `/html/body` or any other container.
 
 ### How the injector makes these rules enforceable
 
 From the injector source (`digital/src/js/ads/AutoInjector.js` and `AutoInjectorAlgorithm.js` in the platform repo):
 
-- **Include (XPath) accepts several XPaths separated by `;`.** They are tried in order and the first one that resolves to a node wins. That is how one unit covers "right sidebar or left sidebar".
+- **Include (XPath) accepts several XPaths separated by `;`.** They are tried in order and the first one that resolves to a node wins. That is how one unit covers "right sidebar, else left sidebar, else (Medium Rectangle only) the article body".
 - Each XPath resolves with `FIRST_ORDERED_NODE_TYPE`: if it matches several elements, the **first in document order** is used, so it must match exactly the sidebar column and nothing earlier on the page.
-- **If no XPath resolves, nothing is injected.** The log shows `The xPath was not found` and the unit's `errors` gets `xPath was not found: …`. For a sidebar unit on a non-article page, or an article with no sidebar, **that error is rules 1 and 4 working — not a bug.**
-- **"Append" is a plain `context.appendChild(div)`**, so the ad becomes the last child of the resolved sidebar, which is rule 3. Append does not read Exclude (XPath), Minimum Spacing, or Node Offset (only In-Content and Middle do).
+- **If no XPath resolves, nothing is injected.** The log shows `The xPath was not found` and the unit's `errors` gets `xPath was not found: …`. For either unit on a non-article page, or the Skyscraper on an article with no sidebar, **that error is rules 1 and 4 working — not a bug.**
+- **"Append" is a plain `context.appendChild(div)`**, so the ad becomes the last child of whichever container resolved: the sidebar (rule 3) or, for the Medium Rectangle's fallback, the article body (rule 4). The algorithm is set once per unit, and Append is right for both containers. Append does not read Exclude (XPath), Minimum Spacing, or Node Offset (only In-Content and Middle do).
 
-So all four rules are expressed by two settings: an article-guarded sidebar **Include (XPath)** plus **Injection Algorithm = Append**.
+So every rule is expressed by two settings: an ordered, article-guarded **Include (XPath)** plus **Injection Algorithm = Append**.
 
-### 1. Find the sidebar container and the article-page marker
+### 1. Find the sidebar container and the article-body container
 
 Work on a real article page of the target site. Never guess, and never copy another property's XPath — templates differ even on the same CMS platform.
 
@@ -150,22 +185,36 @@ cands.filter(el => !cands.some(o => o !== el && o.contains(el))).map(el => {
 ```
 
 - Pick the **sidebar column itself**: the element beside the article text. Don't pick a widget inside it (`<aside class="widget">`, `.sidebar-widget`), because Append would put the ad at the bottom of that one widget. Don't pick a wrapper that also contains the article body either.
-- The **article-page marker** is an element present on every article page and on no other page. Usually this is the same article-body container the property's In-Content units target (e.g. `#sno-story-body-content` on some SNO sites; verify on the target site). Load the home page and a section/listing page and confirm the marker is absent on both.
+- The **article-body container** does two jobs. It is the **article-page marker** that guards the sidebar XPaths, and it is the **Medium Rectangle's no-sidebar fallback** target. It must be:
+  - present on every article page and on no other page. Load the home page and a section/listing page and confirm it is absent on both;
+  - the container of just the article text, so its last child is the end of the article. Don't use a wrapper that also holds comments, related stories, share bars or the sidebar, because Append would put the ad after all of those.
+
+  Usually it is the same container the property's In-Content units target (e.g. `#sno-story-body-content` on some SNO sites; verify on the target site).
+- Also load an article that has **no** sidebar, if the site has such a template (e.g. a full-width feature layout). Confirm the sidebar is really absent from the DOM, not just hidden, and that the article-body container is still there.
 - If an article template has **both** a left and a right sidebar, the first XPath in the `;` list wins. Ask the account manager which side they want; don't pick silently.
 
 ### 2. Build the Include (XPath)
 
-```
-//<right-sidebar>[//<article-marker>];//<left-sidebar>[//<article-marker>]
-```
-
-A predicate that starts with `//` is evaluated from the **document root**, not from the sidebar. So `[//div[@id="sno-story-body-content"]]` means "only if this page has an article body anywhere", which is the article-only gate. **Every** XPath in the list needs it: an unguarded entry makes the unit inject into the home page's sidebar. Example (the ids are placeholders; use what step 1 found):
+**Skyscraper**: sidebar entries only.
 
 ```
-//div[@id="sidebar"][//div[@id="sno-story-body-content"]]
+//<right-sidebar>[//<article-body>];//<left-sidebar>[//<article-body>]
 ```
 
-Use one XPath when the site has only one sidebar position. Add the `;` alternative only when its article templates really do vary between left and right. Prefer an `id`. For a class, match the exact token (`contains(concat(' ',normalize-space(@class),' '),' <class> ')`) rather than a bare `contains(@class,'sidebar')`, which also matches `sidebar-widget`.
+**Medium Rectangle**: the same sidebar entries, then the article-body container as the **last** entry.
+
+```
+//<right-sidebar>[//<article-body>];//<left-sidebar>[//<article-body>];//<article-body>
+```
+
+A predicate that starts with `//` is evaluated from the **document root**, not from the sidebar. So `[//div[@id="sno-story-body-content"]]` means "only if this page has an article body anywhere", which is the article-only gate. **Every sidebar entry** needs it: an unguarded entry makes the unit inject into the home page's sidebar. The trailing article-body entry needs no guard, because that element only exists on article pages. It must stay **last**, or it would win over the sidebar on pages that have one. Examples (the ids are placeholders; use what step 1 found):
+
+```
+Skyscraper:        //div[@id="sidebar"][//div[@id="sno-story-body-content"]]
+Medium Rectangle:  //div[@id="sidebar"][//div[@id="sno-story-body-content"]];//div[@id="sno-story-body-content"]
+```
+
+Use one sidebar XPath when the site has only one sidebar position. Add the `;` alternative only when its article templates really do vary between left and right. Prefer an `id`. For a class, match the exact token (`contains(concat(' ',normalize-space(@class),' '),' <class> ')`) rather than a bare `contains(@class,'sidebar')`, which also matches `sidebar-widget`.
 
 Test the XPath in the console **before** saving it:
 
@@ -177,20 +226,31 @@ xp.split(';').map(x => {
 })
 ```
 
-It must find the sidebar column on an article page that has one. It must return `null` for **every** entry on the home page, on a section/listing page, and on an article without a sidebar (e.g. a full-width feature template, if the site has one).
+The first entry that is not `null` is where the unit injects. Expected results:
+
+| Page | Skyscraper | Medium Rectangle |
+|---|---|---|
+| Article with a sidebar | a sidebar entry finds the sidebar column | a sidebar entry finds the sidebar column (it comes before the article-body entry) |
+| Article without a sidebar | every entry `null` | sidebar entries `null`, last entry finds the article-body container |
+| Home page, section/listing page | every entry `null` | every entry `null` |
 
 ### 3. Placement Settings for each unit
 
-- **Include (XPath)**: the guarded value from step 2.
+- **Include (XPath)**: the unit's own value from step 2. The two units' values differ: only the Medium Rectangle has the article-body fallback.
 - **Injection Algorithm**: **Append**. It's a Tom-Select dropdown: click the real widget, then verify after a reload (see Pattern A).
 - Leave Exclude (XPath), Custom CSS and Close Button as they are unless asked. Append ignores Exclude (XPath).
 - Medium Rectangle and Skyscraper are separate ad units, each edited individually (no bulk edit). When both go into the same sidebar, both are appended, and whichever injects second lands below the other (see Pattern A: naming is not placement). If the stacking order matters to the publisher, ask; don't assume.
 
-### 4. Verify all four rules
+### 4. Verify every rule, for both units
 
-1. On an article page with a sidebar, load `?fddebug&fdtest`. The unit's log shows `Injecting ad unit at xPath` and then `append ad unit div … into context <sidebar>`. The unit's div's `parentElement` is the sidebar column, and nothing of the sidebar's own content sits below it. Take a screenshot of it rendering at the bottom of the sidebar.
-2. On the home page, a section/listing page, and (if the site has one) an article without a sidebar, the log shows `The xPath was not found`, and `document.querySelector('.flytead-au_XXXX')` is `null`.
-3. Check the article at phone width too. If the theme hides the sidebar (`display: none`) there, the unit still resolves and injects into the hidden container. Report that to the user instead of changing other settings unasked.
+Load each page with `?fddebug&fdtest`:
+
+1. **Article with a sidebar, both units.** The log shows `Injecting ad unit at xPath`, then `append ad unit div … into context <sidebar>`. The unit's div's `parentElement` is the sidebar column, and nothing of the sidebar's own content sits below it. Take a screenshot of it rendering at the bottom of the sidebar.
+2. **Article without a sidebar** (if the site has that template):
+   - Medium Rectangle: the log shows `append ad unit div … into context <article-body>`. Its div is the article-body container's last child, below the last paragraph. Take a screenshot.
+   - Skyscraper: the log shows `The xPath was not found`, and `document.querySelector('.flytead-au_XXXX')` is `null`.
+3. **Home page and a section/listing page, both units.** The log shows `The xPath was not found`, and the unit's div is absent.
+4. **Article at phone width.** If the theme hides the sidebar (`display: none`) there, the sidebar entry still resolves, so the unit injects into the hidden container (the Medium Rectangle does not fall back to the article body). Report that to the user instead of changing other settings unasked.
 
 ## Common bug: an In-Content unit scoped to `/html/body`
 
@@ -438,9 +498,10 @@ If the live paragraph count is below the unit's `nodeOffset.count`, that's the m
 - Treating "no ads returned" in the Kevel logs as a placement bug — it's a separate fill/inventory investigation with a different fix.
 - Editing Placement Settings before reading the injector Logs. The log tells you exactly what XPath ran and what it found; skipping it means debugging blind.
 - Concluding "zero fill / Kevel issue" from DOM presence/absence or a quick glance alone — always verify with computed style (`getComputedStyle(el).opacity`, `.display`) plus a visual screenshot first (see Pattern B).
-- Giving a sidebar unit (Medium Rectangle / Skyscraper) a fallback to `/html/body`, the article body, or any non-sidebar container — when no sidebar is found the unit must not inject at all.
-- A sidebar unit XPath without the `[//<article-marker>]` guard on every `;` entry — it injects into the home page's and listing pages' sidebar.
-- Treating `The xPath was not found` on a non-article page, or a sidebar-less article, as a bug for a sidebar unit — it's the article-only / no-sidebar rule working.
+- Giving the Skyscraper any non-sidebar fallback. With no sidebar it must not inject at all.
+- Giving the Medium Rectangle any no-sidebar fallback other than the article-body container (never `/html/body`, never a wrapper that also holds comments or related stories), or putting that fallback anywhere but **last** in the `;` list.
+- A sidebar-unit XPath where a sidebar entry lacks the `[//<article-body>]` guard. It injects into the home page's and listing pages' sidebars.
+- Treating `The xPath was not found` as a bug when it appears on a non-article page (either unit) or on a sidebar-less article (Skyscraper). That's the article-only / no-sidebar rule working.
 - Fixing an XPath and stopping there — always also check Injection Algorithm. An XPath-only fix can leave the ad correctly scoped but still landing in the wrong spot (Pattern A).
 - Driving a Tom-Select (or similar JS-enhanced) dropdown by setting the value on the underlying hidden `<select>` via JS instead of clicking the real widget — it can appear to work in a screenshot while silently failing to persist (Pattern A).
 - Concluding a fix "didn't take" seconds after an SSP save without budgeting for real propagation delay — it commonly takes 6-10+ minutes on this platform, not seconds (Pattern B).
